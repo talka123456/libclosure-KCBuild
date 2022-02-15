@@ -166,7 +166,9 @@ static struct Block_descriptor_3 * _Block_descriptor_3(struct Block_layout *aBlo
 
 static void _Block_call_copy_helper(void *result, struct Block_layout *aBlock)
 {
+    // 这里其实就是获取clang 编译后的copy函数指针, 然后调用, dst src分别为malloc block和stack block
     if (auto *pFn = _Block_get_copy_function(aBlock))
+        // 调用Block内的copy函数, 该函数本质是调用_Block_object_assign, 并获取入参
         pFn(result, aBlock);
 }
 
@@ -191,20 +193,25 @@ void *_Block_copy(const void *arg) {
     if (!arg) return NULL;
     
     // The following would be better done as a switch statement
+    // 将StackBlock 转为Block_layout类型
     aBlock = (struct Block_layout *)arg;
     if (aBlock->flags & BLOCK_NEEDS_FREE) {
         // latches on high
         latching_incr_int(&aBlock->flags);
         return aBlock;
     }
+    // global block 不需要处理引用计数
     else if (aBlock->flags & BLOCK_IS_GLOBAL) {
         return aBlock;
     }
-    else {// 栈 - 堆 (编译期)
+    else {
+        // 栈 - 堆 (编译期)
         // Its a stack block.  Make a copy.
+        // 获取大小, 并开辟内存空间
         size_t size = Block_size(aBlock);
         struct Block_layout *result = (struct Block_layout *)malloc(size);
         if (!result) return NULL;
+        // 拷贝, memmove不会导致拷贝时先后时序导致的数据覆盖
         memmove(result, aBlock, size); // bitcopy first
 #if __has_feature(ptrauth_calls)
         // Resign the invoke pointer as it uses address authentication.
@@ -227,8 +234,13 @@ void *_Block_copy(const void *arg) {
 #endif
 #endif
         // reset refcount
+        // 将flag中指定位置(0~15)为0
         result->flags &= ~(BLOCK_REFCOUNT_MASK|BLOCK_DEALLOCATING);    // XXX not needed
+        
+        // 将第24位和第二位置为1
         result->flags |= BLOCK_NEEDS_FREE | 2;  // logical refcount 1
+        
+        // 入参为新创建的malloc block 和 原来的stack block
         _Block_call_copy_helper(result, aBlock);
         // Set isa last so memory analysis tools see a fully-initialized object.
         result->isa = _NSConcreteMallocBlock;
@@ -243,24 +255,30 @@ void *_Block_copy(const void *arg) {
 // Closures that aren't copied must still work, so everyone always accesses variables after dereferencing the forwarding ptr.
 // We ask if the byref pointer that we know about has already been copied to the heap, and if so, increment and return it.
 // Otherwise we need to copy it and update the stack forwarding pointer
+
 static struct Block_byref *_Block_byref_copy(const void *arg) {
     struct Block_byref *src = (struct Block_byref *)arg;
 
-    // __block 内存是一样 同一个家伙
-    //
+    //Block_byref和Clang编译的__Block_byref_a_0, 是一致的
+    
     if ((src->forwarding->flags & BLOCK_REFCOUNT_MASK) == 0) {
         // src points to stack
+        // 给栈Block中的成员变量 开辟堆空间
         struct Block_byref *copy = (struct Block_byref *)malloc(src->size);
         copy->isa = NULL;
         // byref value 4 is logical refcount of 2: one for caller, one for stack
         copy->flags = src->flags | BLOCK_BYREF_NEEDS_FREE | 4;
         copy->forwarding = copy; // patch heap copy to point to itself
+        
+        // 这里是能在后续继续访问修改的变量值的核心, 将stack block中的ivars__forwarding指向堆上, 修改获读取都是从堆上操作, 保持了一致性
         src->forwarding = copy;  // patch stack to point to heap copy
         copy->size = src->size;
 
         if (src->flags & BLOCK_BYREF_HAS_COPY_DISPOSE) {
             // Trust copy helper to copy everything of interest
             // If more than one field shows up in a byref block this is wrong XXX
+            
+            //Block_byref在内存中的布局和desc类似, 紧邻所以可以直接通过指针读取
             struct Block_byref_2 *src2 = (struct Block_byref_2 *)(src+1);
             struct Block_byref_2 *copy2 = (struct Block_byref_2 *)(copy+1);
             copy2->byref_keep = src2->byref_keep;
@@ -484,6 +502,7 @@ So the __block copy/dispose helpers will generate flag values of 3 or 7 for obje
 void _Block_object_assign(void *destArg, const void *object, const int flags) {
     const void **dest = (const void **)destArg;
     switch (os_assumes(flags & BLOCK_ALL_COPY_DISPOSE_FLAGS)) {
+            // 如果是对象,则交给ARC处理
       case BLOCK_FIELD_IS_OBJECT:
         /*******
         id object = ...;
@@ -495,6 +514,7 @@ void _Block_object_assign(void *destArg, const void *object, const int flags) {
         *dest = object;
         break;
 
+            // 如果是Block, 则递归执行_BLock_copy
       case BLOCK_FIELD_IS_BLOCK:
         /*******
         void (^object)(void) = ...;
@@ -504,6 +524,7 @@ void _Block_object_assign(void *destArg, const void *object, const int flags) {
         *dest = _Block_copy(object);
         break;
     
+            // __block __weak 修饰的,
       case BLOCK_FIELD_IS_BYREF | BLOCK_FIELD_IS_WEAK:
       case BLOCK_FIELD_IS_BYREF:
         /*******
@@ -515,6 +536,7 @@ void _Block_object_assign(void *destArg, const void *object, const int flags) {
          [^{ x; } copy];
          ********/
 
+            // 这里的入参是stack 上的block对象中的成员变量
         *dest = _Block_byref_copy(object);
         break;
         
@@ -532,6 +554,7 @@ void _Block_object_assign(void *destArg, const void *object, const int flags) {
         *dest = object;
         break;
 
+            // 同时使用__weak __block 修饰的对象
       case BLOCK_BYREF_CALLER | BLOCK_FIELD_IS_OBJECT | BLOCK_FIELD_IS_WEAK:
       case BLOCK_BYREF_CALLER | BLOCK_FIELD_IS_BLOCK  | BLOCK_FIELD_IS_WEAK:
         /*******

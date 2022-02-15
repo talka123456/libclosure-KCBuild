@@ -275,11 +275,11 @@ struct Block_descriptor_small {
 };
 
 struct Block_layout {
-    void * __ptrauth_objc_isa_pointer isa;
-    volatile int32_t flags; // contains ref count
-    int32_t reserved;
-    BlockInvokeFunction invoke;
-    struct Block_descriptor_1 *descriptor;
+    void * __ptrauth_objc_isa_pointer isa; // 8字节isa指针
+    volatile int32_t flags; // contains ref count // 4字节标识符
+    int32_t reserved; // 4字节 保留位
+    BlockInvokeFunction invoke; // 8字节函数指针
+    struct Block_descriptor_1 *descriptor; // 8字节描述对象
     // imported variables
 };
 
@@ -396,6 +396,7 @@ _Block_set_invoke_fn(struct Block_layout *block, void (*fn)(void *, ...))
 static inline __typeof__(void (*)(void *, const void *))
 _Block_get_copy_fn(struct Block_descriptor_2 *desc)
 {
+    // 宏定义的目的是为了不同的版本复用代码
     return (void (*)(void *, const void *))_Block_get_function_pointer(desc->copy);
 }
 
@@ -420,6 +421,7 @@ _Block_set_dispose_fn(struct Block_descriptor_2 *desc,
     _Block_set_function_pointer(desc->dispose, fn);
 }
 
+// 内联函数, 获取aBlock中的desc对象指针
 static inline void *
 _Block_get_descriptor(struct Block_layout *aBlock)
 {
@@ -436,8 +438,10 @@ _Block_get_descriptor(struct Block_layout *aBlock)
                 aBlock->descriptor, ptrauth_key_asda, disc);
     }
 #elif __has_feature(ptrauth_calls)
+    // 如果存在指针身份验证, 使用ptrauth_strip()进行
     descriptor = (void *)ptrauth_strip(aBlock->descriptor, ptrauth_key_asda);
 #else
+    // 直接读取成员变量
     descriptor = (void *)aBlock->descriptor;
 #endif
 
@@ -450,14 +454,19 @@ _Block_set_descriptor(struct Block_layout *aBlock, void *desc)
     aBlock->descriptor = (struct Block_descriptor_1 *)desc;
 }
 
+// 内联 通过desc对象获取
 static inline __typeof__(void (*)(void *, const void *))
 _Block_get_copy_function(struct Block_layout *aBlock)
 {
+    // 如果标志位BLOCK_HAS_COPY_DISPOSE为0, 直接返回 表示没有copy/dispose 函数指针
     if (!(aBlock->flags & BLOCK_HAS_COPY_DISPOSE))
         return NULL;
 
+    // 获取Block的desc指针
     void *desc = _Block_get_descriptor(aBlock);
+    
 #if BLOCK_SMALL_DESCRIPTOR_SUPPORTED
+    // 如果支持 BLOCK_SMALL_DESCRIPTOR, 直接类型强制转换, 然后通过宏定义函数读取
     if (aBlock->flags & BLOCK_SMALL_DESCRIPTOR) {
         struct Block_descriptor_small *bds =
                 (struct Block_descriptor_small *)desc;
@@ -466,9 +475,11 @@ _Block_get_copy_function(struct Block_layout *aBlock)
     }
 #endif
 
+    // 这里的逻辑起始就是从desc1起始地址 + desc size; 因为desc排序是相邻的desc1 desc2 desc3, 根据内存可直接获取到对应的对象
     struct Block_descriptor_2 *bd2 =
             (struct Block_descriptor_2 *)((unsigned char *)desc +
                                           sizeof(struct Block_descriptor_1));
+    // 这里就是获取desc2的copy函数指针
     return _Block_get_copy_fn(bd2);
 }
 
